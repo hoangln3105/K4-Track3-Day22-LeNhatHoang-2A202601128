@@ -88,6 +88,23 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 )
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+# Unsloth's 4-bit Qwen2.5 *base* repos ship no chat template (only the -Instruct
+# ones do), so apply_chat_template() raises ValueError. Install ChatML -- Qwen2.5's
+# native format -- and make <|im_end|> the stop token so generation actually halts.
+if tokenizer.chat_template is None:
+    tokenizer.chat_template = (
+        "{% for message in messages %}"
+        "{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+    )
+    tokenizer.eos_token = "<|im_end|>"
+    print("Installed ChatML chat template; eos_token -> <|im_end|>")
+
+# Keep pad != eos: if they are the same token the collator masks the very eos the
+# model has to learn to emit, and generation never stops on its own.
+if tokenizer.pad_token == tokenizer.eos_token:
+    tokenizer.pad_token = "<|endoftext|>"
 
 # Load SFT adapter on top of base
 model = PeftModel.from_pretrained(model, str(SFT_PATH), is_trainable=True)
@@ -193,7 +210,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 logs = pd.DataFrame(trainer.state.log_history)
-logs = logs[logs["loss"].notna() if "loss" in logs.columns else logs.index].copy()
+logs = logs[logs["loss"].notna()].copy() if "loss" in logs.columns else logs.copy()
 
 # TRL DPO logs include rewards/chosen, rewards/rejected, rewards/margins, kl
 chosen_col = "rewards/chosen" if "rewards/chosen" in logs.columns else None
@@ -237,6 +254,10 @@ plt.show()
 # Read this cell carefully — it tells you which kind of "reward gap up" you got.
 
 # %%
+# Bound up-front: on a very short run the block below never executes, and the
+# metrics cell would otherwise die with NameError after a full training run.
+last_chosen = last_rejected = last_gap = chosen_delta = None
+
 if chosen_col and rejected_col and len(logs) >= 5:
     last_chosen = logs[chosen_col].iloc[-5:].mean()
     last_rejected = logs[rejected_col].iloc[-5:].mean()
@@ -282,9 +303,9 @@ metrics = {
     "lr": LR,
     "epochs": EPOCHS,
     "final_train_loss": float(train_result.training_loss),
-    "end_chosen_reward": float(last_chosen) if chosen_col else None,
-    "end_rejected_reward": float(last_rejected) if rejected_col else None,
-    "end_reward_gap": float(last_gap) if chosen_col and rejected_col else None,
+    "end_chosen_reward": None if last_chosen is None else float(last_chosen),
+    "end_rejected_reward": None if last_rejected is None else float(last_rejected),
+    "end_reward_gap": None if last_gap is None else float(last_gap),
 }
 (DPO_OUT / "dpo_metrics.json").write_text(json.dumps(metrics, indent=2))
 print(f"Wrote metrics to {DPO_OUT / 'dpo_metrics.json'}")

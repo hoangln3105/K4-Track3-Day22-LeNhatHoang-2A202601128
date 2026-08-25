@@ -15,6 +15,11 @@ import re
 import sys
 from pathlib import Path
 
+# Windows consoles default to cp1252, which cannot encode the box-drawing and
+# check marks below -- the script would die with UnicodeEncodeError mid-report.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 TEMPLATE_MARKERS = [
     r"<Họ Tên>",
     r"<A20-K1 / A20-K2",

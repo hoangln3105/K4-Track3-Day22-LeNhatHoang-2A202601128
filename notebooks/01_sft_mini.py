@@ -41,7 +41,7 @@ else:  # BIGGPU
     PER_DEVICE_BATCH = 2
     GRAD_ACCUM = 4
 
-SFT_DATASET = os.environ.get("SFT_DATASET", "5CD-AI/Vietnamese-alpaca-cleaned")
+SFT_DATASET = os.environ.get("SFT_DATASET", "5CD-AI/Vietnamese-alpaca-gpt4-gg-translated")
 SFT_SLICE = 1000
 NUM_EPOCHS = 1
 
@@ -85,6 +85,24 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
     print("Set tokenizer.pad_token = eos_token")
 
+# Unsloth's 4-bit Qwen2.5 *base* repos ship no chat template (only the -Instruct
+# ones do), so apply_chat_template() raises ValueError. Install ChatML -- Qwen2.5's
+# native format -- and make <|im_end|> the stop token so generation actually halts.
+if tokenizer.chat_template is None:
+    tokenizer.chat_template = (
+        "{% for message in messages %}"
+        "{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+    )
+    tokenizer.eos_token = "<|im_end|>"
+    print("Installed ChatML chat template; eos_token -> <|im_end|>")
+
+# Keep pad != eos: if they are the same token the collator masks the very eos the
+# model has to learn to emit, and generation never stops on its own.
+if tokenizer.pad_token == tokenizer.eos_token:
+    tokenizer.pad_token = "<|endoftext|>"
+
 # %%
 model = FastLanguageModel.get_peft_model(
     model,
@@ -106,7 +124,7 @@ print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requir
 # %% [markdown]
 # ## 2. Load + format VN Alpaca slice
 #
-# `5CD-AI/Vietnamese-alpaca-cleaned` is a 50k-row VN Alpaca translation. Lab 21
+# `5CD-AI/Vietnamese-alpaca-gpt4-gg-translated` is a 52k-row VN Alpaca-GPT4 translation. Lab 21
 # uses 1k slice for the demo run; we match that exactly so reward gap is comparable.
 
 # %%
@@ -118,20 +136,33 @@ print(f"\nFirst row:\n{ds[0]}")
 
 # %%
 # Alpaca → ChatML format (Qwen2.5's native template)
+# This dataset ships *_vi / *_en columns, not the plain Alpaca names. Read the VN
+# columns first and fall back, so a plain-Alpaca dataset still works unchanged.
+def _field(row, name):
+    return (row.get(f"{name}_vi") or row.get(name) or "").strip()
+
+
 def format_alpaca_to_chat(row):
-    messages = []
-    if row.get("instruction"):
-        prompt = row["instruction"]
-        if row.get("input"):
-            prompt += "\n\n" + row["input"]
-        messages.append({"role": "user", "content": prompt})
-    if row.get("output"):
-        messages.append({"role": "assistant", "content": row["output"]})
+    instruction = _field(row, "instruction")
+    extra = _field(row, "input")
+    output = _field(row, "output")
+    if not instruction or not output:
+        return {"text": ""}
+    prompt = f"{instruction}\n\n{extra}" if extra else instruction
+    messages = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": output},
+    ]
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     return {"text": text}
 
 
 ds_formatted = ds.map(format_alpaca_to_chat, remove_columns=ds.column_names)
+ds_formatted = ds_formatted.filter(lambda row: row["text"])
+# Guard: mismatched column names produce empty strings, which trains on nothing
+# without ever raising. Fail loudly instead.
+assert len(ds_formatted) > 0, f"No usable rows in {SFT_DATASET} — check its column names."
+print(f"Usable rows after formatting: {len(ds_formatted)} / {len(ds)}")
 print(f"\nSample formatted text (first 500 chars):\n{ds_formatted[0]['text'][:500]}")
 
 # %% [markdown]

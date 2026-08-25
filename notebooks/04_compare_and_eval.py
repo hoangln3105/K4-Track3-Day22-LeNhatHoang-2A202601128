@@ -79,6 +79,23 @@ def generate_with_adapter(adapter_path: Path, prompts: list[dict], max_new_token
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Unsloth's 4-bit Qwen2.5 *base* repos ship no chat template (only the -Instruct
+    # ones do), so apply_chat_template() raises ValueError. Install ChatML -- Qwen2.5's
+    # native format -- and make <|im_end|> the stop token so generation actually halts.
+    if tokenizer.chat_template is None:
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+        )
+        tokenizer.eos_token = "<|im_end|>"
+        print("Installed ChatML chat template; eos_token -> <|im_end|>")
+    
+    # Keep pad != eos: if they are the same token the collator masks the very eos the
+    # model has to learn to emit, and generation never stops on its own.
+    if tokenizer.pad_token == tokenizer.eos_token:
+        tokenizer.pad_token = "<|endoftext|>"
 
     model = PeftModel.from_pretrained(model, str(adapter_path))
     FastLanguageModel.for_inference(model)
